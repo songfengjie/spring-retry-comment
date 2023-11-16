@@ -83,22 +83,47 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 
 	private static final SpelExpressionParser PARSER = new SpelExpressionParser();
 
+	/**
+	 * 拦截器对象的默认实现
+	 * 1、用户未指定且
+	 * 2、根据注解信息无法构建对应的拦截器对象时
+	 * 3、或者构建拦截器对象的过程异常
+	 * 当1&&(2||3)=true时，构建默认的拦截器对象，抛出异常
+	 */
 	private static final MethodInterceptor NULL_INTERCEPTOR = methodInvocation -> {
 		throw new OperationNotSupportedException("Not supported");
 	};
 
+	/**
+	 * beanFactory解析器
+	 */
 	private final StandardEvaluationContext evaluationContext = new StandardEvaluationContext();
 
+	/**
+	 * 装载拦截器对象的容器（缓存）
+	 */
 	private final ConcurrentReferenceHashMap<Object, ConcurrentMap<Method, MethodInterceptor>> delegates = new ConcurrentReferenceHashMap<>();
 
+	/**
+	 * 有状态场景时，重试上下文的缓存对象
+	 * 有状态即Retryable#stateful()为true
+	 */
 	private RetryContextCache retryContextCache = new MapRetryContextCache();
 
 	private MethodArgumentsKeyGenerator methodArgumentsKeyGenerator;
 
 	private NewMethodArgumentsIdentifier newMethodArgumentsIdentifier;
 
+	/**
+	 * 睡眠者
+	 * @BackOff
+	 * 退避策略里面设置的重试时间间隔，由睡眠者执行时间间隔
+	 */
 	private Sleeper sleeper;
 
+	/**
+	 * 实现BeanFactoryAware，注入的bean工厂
+	 */
 	private BeanFactory beanFactory;
 
 	private RetryListener[] globalListeners;
@@ -165,14 +190,20 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		// 获取当前方法拦截器
 		MethodInterceptor delegate = getDelegate(invocation.getThis(), invocation.getMethod());
 		if (delegate != null) {
+			/*
+			 * 调用被拦截的方法，aop增强方法
+			 * 这里的delegate实际上是RetryOperationsInterceptor的对象
+			 */
 			return delegate.invoke(invocation);
 		}
 		else {
+			// 没有获取到增强代理对象，直接执行
 			return invocation.proceed();
 		}
 	}
 
 	private MethodInterceptor getDelegate(Object target, Method method) {
+		// 当retryable标注的方法初次加载时，缓存中是没有改方法的，因此需要new，最终放入缓存中，等触发retry的时候，可以直接从缓存读取重试的方法信息
 		ConcurrentMap<Method, MethodInterceptor> cachedMethods = this.delegates.get(target);
 		if (cachedMethods == null) {
 			cachedMethods = new ConcurrentHashMap<>();
@@ -180,6 +211,7 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		MethodInterceptor delegate = cachedMethods.get(method);
 		if (delegate == null) {
 			MethodInterceptor interceptor = NULL_INTERCEPTOR;
+			// 从代理方法上获取retryable注解信息
 			Retryable retryable = AnnotatedElementUtils.findMergedAnnotation(method, Retryable.class);
 			if (retryable == null) {
 				retryable = classLevelAnnotation(method, Retryable.class);
@@ -187,13 +219,19 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 			if (retryable == null) {
 				retryable = findAnnotationOnTarget(target, method, Retryable.class);
 			}
+			// 根据retryable注解信息装配增强拦截器
 			if (retryable != null) {
+				// 如果retryable注解被用户指定了拦截器，那么取用户指定的
 				if (StringUtils.hasText(retryable.interceptor())) {
+					// 这里我们通过beanFactory拿到用户指定的拦截器对象，
+					// 当前对象还是一个object，尚未完成springbean的过程，因为这里我们需要代理这个object
 					interceptor = this.beanFactory.getBean(retryable.interceptor(), MethodInterceptor.class);
 				}
+				// 重试是否有状态，默认是false
 				else if (retryable.stateful()) {
 					interceptor = getStatefulInterceptor(target, method, retryable);
 				}
+				// 无状态的重试，默认的策略
 				else {
 					interceptor = getStatelessInterceptor(target, method, retryable);
 				}
@@ -201,16 +239,28 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 			cachedMethods.putIfAbsent(method, interceptor);
 			delegate = cachedMethods.get(method);
 		}
+		// 放入缓存中，便于后续重试的时候，直接获取拦截器对象
 		this.delegates.putIfAbsent(target, cachedMethods);
 		return delegate == NULL_INTERCEPTOR ? null : delegate;
 	}
 
+	/**
+	 * 找目标对象和方法上的注解信息
+	 *
+	 * @param target
+	 * @param method
+	 * @param annotation
+	 * @return
+	 * @param <A>
+	 */
 	private <A extends Annotation> A findAnnotationOnTarget(Object target, Method method, Class<A> annotation) {
 
 		try {
 			Method targetMethod = target.getClass().getMethod(method.getName(), method.getParameterTypes());
+			// 从方法上获取retryable注解
 			A retryable = AnnotatedElementUtils.findMergedAnnotation(targetMethod, annotation);
 			if (retryable == null) {
+				// 从类上获取retryable注解
 				retryable = classLevelAnnotation(targetMethod, annotation);
 			}
 
@@ -232,10 +282,23 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		return ann;
 	}
 
+	/**
+	 * 缺省值
+	 * 基于retryable参数，默认场景构建的拦截器对象
+	 *
+	 * @param target 被拦截的目标对象
+	 * @param method 目标方法
+	 * @param retryable @Retryable
+	 * @return 拦截器对象
+	 */
 	private MethodInterceptor getStatelessInterceptor(Object target, Method method, Retryable retryable) {
+		// RetryTemplate是实现@Retryable功能的核心代码所在，在这里我们根据retryable提供的参数构建RetryTemplate的对象
 		RetryTemplate template = createTemplate(retryable.listeners());
+		// 设置重试策略
 		template.setRetryPolicy(getRetryPolicy(retryable, true));
+		// 设置退避策略，退避策略构建逻辑，由@Backoff注解中设置的参数来决定
 		template.setBackOffPolicy(getBackoffPolicy(retryable.backoff(), true));
+		// 将template对象创建好后，封装进拦截器对象中，由拦截器对象触发调用核心逻辑
 		return RetryInterceptorBuilder.stateless()
 			.retryOperations(template)
 			.label(retryable.label())
@@ -247,6 +310,9 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		RetryTemplate template = createTemplate(retryable.listeners());
 		template.setRetryContextCache(this.retryContextCache);
 
+		/*
+		 * CircuitBreaker的功能基本已经被Retryable替代，我认为是个即将过期的注解，可以不用了解，也不建议使用这个注解了
+		 */
 		CircuitBreaker circuit = AnnotatedElementUtils.findMergedAnnotation(method, CircuitBreaker.class);
 		if (circuit == null) {
 			circuit = findAnnotationOnTarget(target, method, CircuitBreaker.class);
@@ -269,10 +335,13 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 				.label(label)
 				.build();
 		}
+		// 根据retryable构建重试策略
 		RetryPolicy policy = getRetryPolicy(retryable, false);
 		template.setRetryPolicy(policy);
+		// 根据retryable内的Backoff构建退避策略
 		template.setBackOffPolicy(getBackoffPolicy(retryable.backoff(), false));
 		String label = retryable.label();
+		// 将template对象创建好后，封装进拦截器对象中，由拦截器对象触发调用核心逻辑
 		return RetryInterceptorBuilder.stateful()
 			.keyGenerator(this.methodArgumentsKeyGenerator)
 			.newMethodArgumentsIdentifier(this.newMethodArgumentsIdentifier)
@@ -282,6 +351,13 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 			.build();
 	}
 
+	/**
+	 * 根据注解circuit设置对应的退避策略的openTimeout
+	 * 目前应该不再使用了
+	 *
+	 * @param breaker
+	 * @param circuit
+	 */
 	private void openTimeout(CircuitBreakerRetryPolicy breaker, CircuitBreaker circuit) {
 		String expression = circuit.openTimeoutExpression();
 		if (StringUtils.hasText(expression)) {
@@ -301,6 +377,11 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		breaker.setOpenTimeout(circuit.openTimeout());
 	}
 
+	/**
+	 * 根据注解circuit设置退避策略的resetTimeout
+	 * @param breaker
+	 * @param circuit
+	 */
 	private void resetTimeout(CircuitBreakerRetryPolicy breaker, CircuitBreaker circuit) {
 		String expression = circuit.resetTimeoutExpression();
 		if (StringUtils.hasText(expression)) {
@@ -319,6 +400,11 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		breaker.setResetTimeout(circuit.resetTimeout());
 	}
 
+	/**
+	 * 创建RetryTemplate对象
+	 * @param listenersBeanNames retryable注解中指定的listener
+	 * @return template
+	 */
 	private RetryTemplate createTemplate(String[] listenersBeanNames) {
 		RetryTemplate template = new RetryTemplate();
 		if (listenersBeanNames.length > 0) {
@@ -330,6 +416,11 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		return template;
 	}
 
+	/**
+	 * 根据listenerName获取listener的object
+	 * @param listenersBeanNames 监听器的名称
+	 * @return 监听器对象
+	 */
 	private RetryListener[] getListenersBeans(String[] listenersBeanNames) {
 		RetryListener[] listeners = new RetryListener[listenersBeanNames.length];
 		for (int i = 0; i < listeners.length; i++) {
@@ -338,6 +429,12 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		return listeners;
 	}
 
+	/**
+	 * 构建recover注解标注的方法的抽象
+	 * @param target
+	 * @param method
+	 * @return
+	 */
 	private MethodInvocationRecoverer<?> getRecoverer(Object target, Method method) {
 		if (target instanceof MethodInvocationRecoverer) {
 			return (MethodInvocationRecoverer<?>) target;
@@ -355,8 +452,18 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		return new RecoverAnnotationRecoveryHandler<>(target, method);
 	}
 
+	/**
+	 * 构建重试策略
+	 *
+	 * @param retryable
+	 * @param stateless
+	 * @return
+	 */
 	private RetryPolicy getRetryPolicy(Annotation retryable, boolean stateless) {
 		Map<String, Object> attrs = AnnotationUtils.getAnnotationAttributes(retryable);
+		/*
+			根据注解中填入的相关信息，构建对应的重试的策略
+		 */
 		@SuppressWarnings("unchecked")
 		Class<? extends Throwable>[] includes = (Class<? extends Throwable>[]) attrs.get("value");
 		String exceptionExpression = (String) attrs.get("exceptionExpression");
@@ -380,6 +487,10 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		}
 		final Expression maxAttExpression = parsedExpression;
 		SimpleRetryPolicy simple = null;
+		/*
+			当注解中没有设置value和noRetryFor，构建一个SimpleRetryPolicy或者ExpressionRetryPolicy
+			到底构建哪一个策略取决于exceptionExpression参数
+		 */
 		if (includes.length == 0 && excludes.length == 0) {
 			simple = hasExceptionExpression
 					? new ExpressionRetryPolicy(resolve(exceptionExpression)).withBeanFactory(this.beanFactory)
@@ -399,6 +510,9 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 			policyMap.put(type, false);
 		}
 		boolean retryNotExcluded = includes.length == 0;
+		/*
+			上面的构建条件不满足的话，这里需要接着构建重试策略，逻辑基本一致，不过多了几个参数
+		 */
 		if (simple == null) {
 			if (hasExceptionExpression) {
 				simple = new ExpressionRetryPolicy(maxAttempts, policyMap, true, resolve(exceptionExpression),
@@ -412,6 +526,9 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 				simple.maxAttemptsSupplier(() -> evaluate(maxAttExpression, Integer.class, stateless));
 			}
 		}
+		/*
+			在根据条件，是否需要构建一个notRecoverable的参数，取决于参数notRecoverable
+		 */
 		@SuppressWarnings("unchecked")
 		Class<? extends Throwable>[] noRecovery = (Class<? extends Throwable>[]) attrs.get("notRecoverable");
 		if (noRecovery != null && noRecovery.length > 0) {
@@ -420,6 +537,13 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		return simple;
 	}
 
+	/**
+	 * 构建退避策略
+	 *
+	 * @param backoff 退避注解
+	 * @param stateless 状态
+	 * @return 退避策略
+	 */
 	private BackOffPolicy getBackoffPolicy(Backoff backoff, boolean stateless) {
 		Map<String, Object> attrs = AnnotationUtils.getAnnotationAttributes(backoff);
 		long min = backoff.delay() == 0 ? backoff.value() : backoff.delay();
@@ -469,6 +593,19 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 				stateless);
 	}
 
+	/**
+	 * 根据参数，构建退避策略对象
+	 * @param min 最小延迟
+	 * @param minExp 最小延迟表达式
+	 * @param max 最大延迟
+	 * @param maxExp 最大延迟表达式
+	 * @param multiplier 每次调度间隔的乘数或者调度次数
+	 * @param multExp 乘数表达式
+	 * @param isRandom 是否随机
+	 * @param randomExp 随机表达式
+	 * @param stateless 状态
+	 * @return 退避策略
+	 */
 	private BackOffPolicy buildBackOff(long min, Expression minExp, long max, Expression maxExp, double multiplier,
 			Expression multExp, boolean isRandom, Expression randomExp, boolean stateless) {
 
@@ -501,6 +638,11 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		return builder.build();
 	}
 
+	/**
+	 * 解析表达式
+	 * @param expression 表达式
+	 * @return 解析后的表达式
+	 */
 	private Expression parse(String expression) {
 		if (isTemplate(expression)) {
 			return PARSER.parseExpression(resolve(expression), PARSER_CONTEXT);
@@ -510,11 +652,24 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		}
 	}
 
+	/**
+	 * 判断表达式是否符合模板
+	 * @param expression 表达式
+	 * @return
+	 */
 	private boolean isTemplate(String expression) {
 		return expression.contains(PARSER_CONTEXT.getExpressionPrefix())
 				&& expression.contains(PARSER_CONTEXT.getExpressionSuffix());
 	}
 
+	/**
+	 * 不是模板的情况下，用spring支持的表达式来解析
+	 * @param expression
+	 * @param type
+	 * @param stateless
+	 * @return
+	 * @param <T>
+	 */
 	private <T> T evaluate(Expression expression, Class<T> type, boolean stateless) {
 		Args args = null;
 		if (stateless) {
