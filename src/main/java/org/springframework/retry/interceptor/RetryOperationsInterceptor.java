@@ -50,8 +50,14 @@ import org.springframework.util.StringUtils;
  */
 public class RetryOperationsInterceptor implements MethodInterceptor {
 
+	/**
+	 * retry功能实现的操作者
+	 */
 	private RetryOperations retryOperations = new RetryTemplate();
 
+	/**
+	 * revover功能实现的操作者，可能为空
+	 */
 	private MethodInvocationRecoverer<?> recoverer;
 
 	private String label;
@@ -69,9 +75,18 @@ public class RetryOperationsInterceptor implements MethodInterceptor {
 		this.recoverer = recoverer;
 	}
 
+	/**
+	 * 增强拦截器调用方法
+	 * @param invocation 代理对象
+	 * @return 执行结果
+	 * @throws Throwable 异常
+	 */
 	@Override
 	public Object invoke(final MethodInvocation invocation) throws Throwable {
 
+		/*
+		 * 获取代理对象的目标方法
+		 */
 		String name;
 		if (StringUtils.hasText(this.label)) {
 			name = this.label;
@@ -81,6 +96,10 @@ public class RetryOperationsInterceptor implements MethodInterceptor {
 		}
 		final String label = name;
 
+		/*
+		 * 构建一个retry的回调函数
+		 * 在函数中实现目标方法的调度
+		 */
 		RetryCallback<Object, Throwable> retryCallback = new MethodInvocationRetryCallback<Object, Throwable>(
 				invocation, label) {
 
@@ -99,6 +118,7 @@ public class RetryOperationsInterceptor implements MethodInterceptor {
 				if (this.invocation instanceof ProxyMethodInvocation) {
 					context.setAttribute("___proxy___", ((ProxyMethodInvocation) this.invocation).getProxy());
 					try {
+						// 代理对象执行目标方法
 						return ((ProxyMethodInvocation) this.invocation).invocableClone().proceed();
 					}
 					catch (Exception | Error e) {
@@ -117,10 +137,15 @@ public class RetryOperationsInterceptor implements MethodInterceptor {
 
 		};
 
+		/*
+		 * 构建recover注解的回调函数
+		 * 在函数中实现recover的能力，也就是调度recover注解标注的方法
+		 */
 		if (this.recoverer != null) {
 			ItemRecovererCallback recoveryCallback = new ItemRecovererCallback(invocation.getArguments(),
 					this.recoverer);
 			try {
+				// 执行recover标注的目标方法
 				Object recovered = this.retryOperations.execute(retryCallback, recoveryCallback);
 				return recovered;
 			}
@@ -131,12 +156,13 @@ public class RetryOperationsInterceptor implements MethodInterceptor {
 				}
 			}
 		}
-
+		// 调度器，retry的逻辑需要一个调度器调度起来，这里就是执行的入口
 		return this.retryOperations.execute(retryCallback);
 
 	}
 
 	/**
+	 * 构建recover注解的回调函数的类
 	 * @author Dave Syer
 	 *
 	 */
@@ -144,6 +170,9 @@ public class RetryOperationsInterceptor implements MethodInterceptor {
 
 		private final Object[] args;
 
+		/**
+		 * 需要将recover的增强拦截器对象注入，recover的逻辑由该对象调起
+		 */
 		private final MethodInvocationRecoverer<?> recoverer;
 
 		/**
@@ -154,6 +183,11 @@ public class RetryOperationsInterceptor implements MethodInterceptor {
 			this.recoverer = recoverer;
 		}
 
+		/**
+		 * 通过recoverer调度起recover方法
+		 * @param context the current retry context
+		 * @return
+		 */
 		@Override
 		public Object recover(RetryContext context) {
 			return this.recoverer.recover(this.args, context.getLastThrowable());

@@ -271,7 +271,9 @@ public class RetryTemplate implements RetryOperations {
 	protected <T, E extends Throwable> T doExecute(RetryCallback<T, E> retryCallback,
 			RecoveryCallback<T> recoveryCallback, RetryState state) throws E, ExhaustedRetryException {
 
+		// 重试策略
 		RetryPolicy retryPolicy = this.retryPolicy;
+		// 退避策略
 		BackOffPolicy backOffPolicy = this.backOffPolicy;
 
 		// Allow the retry policy to initialise itself...
@@ -312,11 +314,16 @@ public class RetryTemplate implements RetryOperations {
 			}
 
 			/*
+			 * 下面的循环，是retry能力逻辑的主要大纲
 			 * We allow the whole loop to be skipped if the policy or context already
 			 * forbid the first try. This is used in the case of external retry to allow a
 			 * recovery in handleRetryExhausted without the callback processing (which
 			 * would throw an exception).
 			 */
+			// 判断是否可以重试，如果可以重试，调度目标方法，
+			// 如果成功：直接结束
+			// 如果失败：捕获异常，根据退避策略退避后，在尝试retry
+			// 直到次数耗尽
 			while (canRetry(retryPolicy, context) && !context.isExhaustedOnly()) {
 
 				try {
@@ -326,29 +333,40 @@ public class RetryTemplate implements RetryOperations {
 					// Reset the last exception, so if we are successful
 					// the close interceptors will not think we failed...
 					lastException = null;
+					// 执行重试，即调度被代理的目标方法
 					T result = retryCallback.doWithRetry(context);
+					// 目标方法执行成功后处理
 					doOnSuccessInterceptors(retryCallback, context, result);
 					return result;
 				}
 				catch (Throwable e) {
-
+					// 目标方法执行异常
 					lastException = e;
 
 					try {
+						// 注册异常信息
 						registerThrowable(retryPolicy, state, context, e);
 					}
 					catch (Exception ex) {
 						throw new TerminatedRetryException("Could not register throwable", ex);
 					}
 					finally {
+						// 目标方法执行失败后处理
 						doOnErrorInterceptors(retryCallback, context, e);
 					}
-
+					// 判断是否可以重试，如果可以重试，执行退避策略
 					if (canRetry(retryPolicy, context) && !context.isExhaustedOnly()) {
 						try {
+							// 执行退避策略，比如睡眠2秒
 							backOffPolicy.backOff(backOffContext);
 						}
 						catch (BackOffInterruptedException ex) {
+							// 退避策略执行异常记录，
+							/*
+							 * 这里的代码逻辑有点歧义，
+							 * 作者如果是期望记录退避策略的异常，那么不应该抛出异常，这里抛出异常会导致整个retry循环中断
+							 * 作者如果期望中断方法的执行，那么这里也无需记录，或者记录异常信息需要提前到异常抛出之前
+							 */
 							lastException = e;
 							// back off was prevented by another thread - fail the retry
 							if (this.logger.isDebugEnabled()) {
@@ -361,7 +379,9 @@ public class RetryTemplate implements RetryOperations {
 					if (this.logger.isDebugEnabled()) {
 						this.logger.debug("Checking for rethrow: count=" + context.getRetryCount());
 					}
-
+					// 逻辑的最后，在当前的catch代码块中，当前的异常是否需要重新抛出
+					// 抛出异常：retry动作将会中断，不在执行
+					// 不抛出异常：retry动作还会被while循环拉起
 					if (shouldRethrow(retryPolicy, context, state)) {
 						if (this.logger.isDebugEnabled()) {
 							this.logger.debug("Rethrow in retry for policy: count=" + context.getRetryCount());
@@ -384,7 +404,7 @@ public class RetryTemplate implements RetryOperations {
 			if (state == null && this.logger.isDebugEnabled()) {
 				this.logger.debug("Retry failed last attempt: count=" + context.getRetryCount());
 			}
-
+			// while循环执行完毕，retry次数耗尽，记录信息
 			exhausted = true;
 			return handleRetryExhausted(recoveryCallback, context, state);
 
@@ -393,6 +413,7 @@ public class RetryTemplate implements RetryOperations {
 			throw RetryTemplate.<E>wrapIfNecessary(e);
 		}
 		finally {
+			// 不管结果如何，最终需要释放申请的资源
 			close(retryPolicy, context, state, lastException == null || exhausted);
 			doCloseInterceptors(retryCallback, context, lastException);
 			RetrySynchronizationManager.clear();
@@ -436,11 +457,23 @@ public class RetryTemplate implements RetryOperations {
 		}
 	}
 
+	/**
+	 * 注册异常信息
+	 * @param retryPolicy 重试策略
+	 * @param state 状态
+	 * @param context retry信息上下文
+	 * @param e 异常
+	 */
 	protected void registerThrowable(RetryPolicy retryPolicy, RetryState state, RetryContext context, Throwable e) {
 		retryPolicy.registerThrowable(context, e);
 		registerContext(context, state);
 	}
 
+	/**
+	 * 注册上下文
+	 * @param context retry上下文信息
+	 * @param state 状态
+	 */
 	private void registerContext(RetryContext context, RetryState state) {
 		if (state != null) {
 			Object key = state.getKey();
@@ -501,6 +534,12 @@ public class RetryTemplate implements RetryOperations {
 
 	}
 
+	/**
+	 * 构建一个retry上下文，第一次加载时，是new出来的，后面会放入RetrySynchronizationManager的本地缓存中
+	 * @param retryPolicy 重试策略
+	 * @param state 状态
+	 * @return RetryContext
+	 */
 	private RetryContext doOpenInternal(RetryPolicy retryPolicy, RetryState state) {
 		RetryContext context = retryPolicy.open(RetrySynchronizationManager.getContext());
 		if (state != null) {
@@ -512,6 +551,11 @@ public class RetryTemplate implements RetryOperations {
 		return context;
 	}
 
+	/**
+	 * 构建一个retry上下文
+	 * @param retryPolicy 重试策略
+	 * @return RetryContext
+	 */
 	private RetryContext doOpenInternal(RetryPolicy retryPolicy) {
 		return doOpenInternal(retryPolicy, null);
 	}
@@ -580,10 +624,21 @@ public class RetryTemplate implements RetryOperations {
 		return state != null && state.rollbackFor(context.getLastThrowable());
 	}
 
+	/**
+	 * 拦截器支持开放式的
+	 * @param callback
+	 * @param context
+	 * @return
+	 * @param <T>
+	 * @param <E>
+	 */
 	private <T, E extends Throwable> boolean doOpenInterceptors(RetryCallback<T, E> callback, RetryContext context) {
 
 		boolean result = true;
-
+		/*
+		 * 这里的listeners是用户在注解retryable设置的监听，支持用户定义，可控制retry的能力执行与否，或满足用户指定条件才可以retry等
+		 * 注意：用户定义的监听器bean需要交由spring初始化，并且是RetryListener的实现类
+		 */
 		for (RetryListener listener : this.listeners) {
 			result = result && listener.open(context, callback);
 		}
@@ -592,6 +647,14 @@ public class RetryTemplate implements RetryOperations {
 
 	}
 
+	/**
+	 * 使用完成后需要释放资源，防止内存溢出
+	 * @param callback retryCallback
+	 * @param context retryContext
+	 * @param lastException 最终的异常信息
+	 * @param <T>
+	 * @param <E>
+	 */
 	private <T, E extends Throwable> void doCloseInterceptors(RetryCallback<T, E> callback, RetryContext context,
 			Throwable lastException) {
 		for (int i = this.listeners.length; i-- > 0;) {
@@ -599,6 +662,14 @@ public class RetryTemplate implements RetryOperations {
 		}
 	}
 
+	/**
+	 * 执行成功后的后置处理（用户定义）
+	 * @param callback RetryCallback
+	 * @param context RetryContext
+	 * @param result 被代理的目标方法的执行结果
+	 * @param <T>
+	 * @param <E>
+	 */
 	private <T, E extends Throwable> void doOnSuccessInterceptors(RetryCallback<T, E> callback, RetryContext context,
 			T result) {
 		for (int i = this.listeners.length; i-- > 0;) {
@@ -606,6 +677,14 @@ public class RetryTemplate implements RetryOperations {
 		}
 	}
 
+	/**
+	 * 执行失败的后置处理（用户定义）
+	 * @param callback
+	 * @param context
+	 * @param throwable
+	 * @param <T>
+	 * @param <E>
+	 */
 	private <T, E extends Throwable> void doOnErrorInterceptors(RetryCallback<T, E> callback, RetryContext context,
 			Throwable throwable) {
 		for (int i = this.listeners.length; i-- > 0;) {
@@ -621,12 +700,14 @@ public class RetryTemplate implements RetryOperations {
 		if (throwable instanceof Error) {
 			throw (Error) throwable;
 		}
+		// 原始的异常或者说是目标方法的异常
 		else if (throwable instanceof Exception) {
 			@SuppressWarnings("unchecked")
 			E rethrow = (E) throwable;
 			return rethrow;
 		}
 		else {
+			// 整个retry过程发生的异常（非目标方法的异常）
 			throw new RetryException("Exception in retry", throwable);
 		}
 	}

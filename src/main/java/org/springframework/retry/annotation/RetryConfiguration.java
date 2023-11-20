@@ -107,10 +107,13 @@ public class RetryConfiguration extends AbstractPointcutAdvisor
 		this.retryContextCache = findBean(RetryContextCache.class);
 		this.methodArgumentsKeyGenerator = findBean(MethodArgumentsKeyGenerator.class);
 		this.newMethodArgumentsIdentifier = findBean(NewMethodArgumentsIdentifier.class);
+		// 构建一个sleeper，后面的退避策略中使用
 		this.sleeper = findBean(Sleeper.class);
 		Set<Class<? extends Annotation>> retryableAnnotationTypes = new LinkedHashSet<>(1);
 		retryableAnnotationTypes.add(Retryable.class);
+		// 构建切点
 		this.pointcut = buildPointcut(retryableAnnotationTypes);
+		// 构建切面AnnotationAwareRetryOperationsInterceptor
 		this.advice = buildAdvice();
 		this.advice.setBeanFactory(this.beanFactory);
 		if (this.enableRetry != null) {
@@ -120,6 +123,7 @@ public class RetryConfiguration extends AbstractPointcutAdvisor
 
 	@Override
 	public void afterSingletonsInstantiated() {
+		// 构建监听器
 		this.retryListeners = findBeans(RetryListener.class);
 		if (this.retryListeners != null) {
 			this.advice.setListeners(this.retryListeners);

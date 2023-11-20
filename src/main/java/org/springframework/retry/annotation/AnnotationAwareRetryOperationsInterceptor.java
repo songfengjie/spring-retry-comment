@@ -449,6 +449,10 @@ public class AnnotationAwareRetryOperationsInterceptor implements IntroductionIn
 		if (!foundRecoverable.get()) {
 			return null;
 		}
+		/*
+		 * 当目标对象中存在recover注解标注的方法时，那么获取目标方法的抽象
+		 * 具体解析recover注解动作，详见RecoverAnnotationRecoveryHandler
+		 */
 		return new RecoverAnnotationRecoveryHandler<>(target, method);
 	}
 
